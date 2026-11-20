@@ -1,3 +1,11 @@
+> **ferroiced** — fork of [iced](https://github.com/iced-rs/iced) maintained for
+> [Ferrocord](https://github.com/Dasemu/Ferrocord). It is iced **0.14.1**
+> (release commit `df71aa93b`) plus one change: a fast path for opaque raster
+> images in `iced_tiny_skia` (no premultiply for opaque pixels, row-copy blit
+> for 1:1 draws), used for in-app video. Crate names are unchanged so it can be
+> used via `[patch.crates-io]`. Not affiliated with or endorsed by the iced
+> project; all credit for iced goes to its authors (MIT, see `LICENSE`).
+
 <div align="center">
 
 <img src="docs/logo.svg" width="140px" />
