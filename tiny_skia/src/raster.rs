@@ -1,5 +1,5 @@
 use crate::core::image as raster;
-use crate::core::{Rectangle, Size};
+use crate::core::{Rectangle, Size, border};
 use crate::graphics;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -43,6 +43,8 @@ impl Pipeline {
         handle: &raster::Handle,
         filter_method: raster::FilterMethod,
         bounds: Rectangle,
+        clip_bounds: Rectangle,
+        border_radius: border::Radius,
         opacity: f32,
         pixels: &mut tiny_skia::PixmapMut<'_>,
         transform: tiny_skia::Transform,
@@ -56,6 +58,56 @@ impl Pipeline {
 
         let width_scale = bounds.width / image.width() as f32;
         let height_scale = bounds.height / image.height() as f32;
+
+        // Like `iced_wgpu`, the radius rounds the visible area: the image
+        // bounds cut by its clip bounds (the widget bounds).
+        let shape = bounds.intersection(&clip_bounds).unwrap_or(bounds);
+        let mut radii = <[f32; 4]>::from(border_radius);
+        for radius in &mut radii {
+            *radius = radius
+                .max(0.0)
+                .min(shape.width / 2.0)
+                .min(shape.height / 2.0);
+        }
+
+        let quality = match filter_method {
+            raster::FilterMethod::Linear => tiny_skia::FilterQuality::Bilinear,
+            raster::FilterMethod::Nearest => tiny_skia::FilterQuality::Nearest,
+        };
+
+        // Rounded corners: fill the rounded rectangle with the image as a
+        // pattern, like `draw_pixmap` does with a plain rectangle.
+        if radii.iter().any(|radius| *radius > 0.0) {
+            let path = crate::engine::rounded_rectangle(shape, radii);
+            let pattern = tiny_skia::Pattern::new(
+                image,
+                tiny_skia::SpreadMode::Pad,
+                quality,
+                opacity,
+                tiny_skia::Transform::from_row(
+                    width_scale,
+                    0.0,
+                    0.0,
+                    height_scale,
+                    bounds.x,
+                    bounds.y,
+                ),
+            );
+
+            pixels.fill_path(
+                &path,
+                &tiny_skia::Paint {
+                    shader: pattern,
+                    anti_alias: true,
+                    ..Default::default()
+                },
+                tiny_skia::FillRule::Winding,
+                transform,
+                clip_mask,
+            );
+
+            return;
+        }
 
         let transform = transform.pre_scale(width_scale, height_scale);
         let x = (bounds.x / width_scale) as i32;
@@ -91,11 +143,6 @@ impl Pipeline {
 
         let Ok(image) = cache.allocate(handle) else {
             return;
-        };
-
-        let quality = match filter_method {
-            raster::FilterMethod::Linear => tiny_skia::FilterQuality::Bilinear,
-            raster::FilterMethod::Nearest => tiny_skia::FilterQuality::Nearest,
         };
 
         pixels.draw_pixmap(

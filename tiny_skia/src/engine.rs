@@ -37,13 +37,27 @@ impl Engine {
         clip_bounds: Rectangle,
     ) {
         let physical_bounds = quad.bounds * transformation;
+        let shadow = quad.shadow;
 
-        if !clip_bounds.intersects(&physical_bounds) {
+        // The shadow reaches past the quad, so it decides visibility and
+        // needs its own clip: drawing it unclipped blends it again over
+        // pixels outside the damage region on every partial redraw.
+        let physical_shadow_bounds = (shadow.color.a > 0.0)
+            .then(|| shadow_bounds(quad) * transformation);
+
+        let visible_bounds = physical_shadow_bounds
+            .map_or(physical_bounds, |bounds| bounds.union(&physical_bounds));
+
+        if !clip_bounds.intersects(&visible_bounds) {
             return;
         }
 
-        let clip_mask = (!physical_bounds.is_within(&clip_bounds))
-            .then_some(clip_mask as &_);
+        let shadow_clip_mask = physical_shadow_bounds
+            .filter(|bounds| !bounds.is_within(&clip_bounds))
+            .map(|_| &*clip_mask);
+
+        let clip_mask =
+            (!physical_bounds.is_within(&clip_bounds)).then_some(&*clip_mask);
 
         let transform = into_transform(transformation);
 
@@ -64,26 +78,26 @@ impl Engine {
 
         let path = rounded_rectangle(quad.bounds, fill_border_radius);
 
-        let shadow = quad.shadow;
-
-        if shadow.color.a > 0.0 {
-            let shadow_bounds = Rectangle {
-                x: quad.bounds.x + shadow.offset.x - shadow.blur_radius,
-                y: quad.bounds.y + shadow.offset.y - shadow.blur_radius,
-                width: quad.bounds.width + shadow.blur_radius * 2.0,
-                height: quad.bounds.height + shadow.blur_radius * 2.0,
-            } * transformation;
-
+        if let Some(shadow_bounds) = physical_shadow_bounds
+            && let Some(visible) = shadow_bounds.intersection(&clip_bounds)
+        {
             let radii = fill_border_radius
                 .into_iter()
                 .map(|radius| radius * transformation.scale_factor())
                 .collect::<Vec<_>>();
-            let (x, y, width, height) = (
-                shadow_bounds.x as u32,
-                shadow_bounds.y as u32,
-                shadow_bounds.width as u32,
-                shadow_bounds.height as u32,
-            );
+            // Same pixel grid as the whole shadow, restricted to the
+            // visible part (the clip mask trims any partial pixel).
+            let (sx, sy) = (shadow_bounds.x as u32, shadow_bounds.y as u32);
+            let (sw, sh) =
+                (shadow_bounds.width as u32, shadow_bounds.height as u32);
+            let x = sx.max(visible.x.floor() as u32);
+            let y = sy.max(visible.y.floor() as u32);
+            let width = (sx + sw)
+                .min((visible.x + visible.width).ceil() as u32)
+                .saturating_sub(x);
+            let height = (sy + sh)
+                .min((visible.y + visible.height).ceil() as u32)
+                .saturating_sub(y);
             let half_width = physical_bounds.width / 2.0;
             let half_height = physical_bounds.height / 2.0;
 
@@ -139,7 +153,7 @@ impl Engine {
                     pixmap.as_ref(),
                     &tiny_skia::PixmapPaint::default(),
                     tiny_skia::Transform::default(),
-                    None,
+                    shadow_clip_mask,
                 );
             }
         }
@@ -562,7 +576,11 @@ impl Engine {
     ) {
         match image {
             #[cfg(feature = "image")]
-            Image::Raster { image, bounds, .. } => {
+            Image::Raster {
+                image,
+                bounds,
+                clip_bounds,
+            } => {
                 let physical_bounds = *bounds * _transformation;
 
                 if !_clip_bounds.intersects(&physical_bounds) {
@@ -585,6 +603,8 @@ impl Engine {
                     &image.handle,
                     image.filter_method,
                     *bounds,
+                    *clip_bounds,
+                    image.border_radius,
                     image.opacity,
                     _pixels,
                     transform,
@@ -665,7 +685,19 @@ fn into_transform(transformation: Transformation) -> tiny_skia::Transform {
     }
 }
 
-fn rounded_rectangle(
+/// The area a quad's shadow covers, in the quad's own coordinates.
+pub(crate) fn shadow_bounds(quad: &Quad) -> Rectangle {
+    let shadow = quad.shadow;
+
+    Rectangle {
+        x: quad.bounds.x + shadow.offset.x - shadow.blur_radius,
+        y: quad.bounds.y + shadow.offset.y - shadow.blur_radius,
+        width: quad.bounds.width + shadow.blur_radius * 2.0,
+        height: quad.bounds.height + shadow.blur_radius * 2.0,
+    }
+}
+
+pub(crate) fn rounded_rectangle(
     bounds: Rectangle,
     border_radius: [f32; 4],
 ) -> tiny_skia::Path {
@@ -857,4 +889,141 @@ pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
         false,
         tiny_skia::Transform::default(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Border, Point, Shadow};
+
+    fn alpha(pixmap: &tiny_skia::Pixmap, x: u32, y: u32) -> u8 {
+        pixmap
+            .pixel(x, y)
+            .map_or(0, tiny_skia::PremultipliedColorU8::alpha)
+    }
+
+    fn shadowed_quad() -> Quad {
+        Quad {
+            bounds: Rectangle::new(
+                Point::new(20.0, 20.0),
+                Size::new(20.0, 20.0),
+            ),
+            border: Border::default(),
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                offset: Vector::ZERO,
+                blur_radius: 8.0,
+            },
+            snap: false,
+        }
+    }
+
+    fn draw_shadowed_quad(clip: Rectangle) -> tiny_skia::Pixmap {
+        let mut engine = Engine::new();
+        let mut pixmap = tiny_skia::Pixmap::new(64, 64).unwrap();
+        let mut mask = tiny_skia::Mask::new(64, 64).unwrap();
+        adjust_clip_mask(&mut mask, clip);
+
+        // Twice, like two partial redraws: nothing may pile up outside.
+        for _ in 0..2 {
+            engine.draw_quad(
+                &shadowed_quad(),
+                &Background::Color(Color::WHITE),
+                Transformation::IDENTITY,
+                &mut pixmap.as_mut(),
+                &mut mask,
+                clip,
+            );
+        }
+
+        pixmap
+    }
+
+    #[test]
+    fn shadow_is_clipped_to_the_damage_region() {
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(32.0, 64.0));
+        let pixmap = draw_shadowed_quad(clip);
+
+        for y in 0..64 {
+            for x in 32..64 {
+                assert_eq!(alpha(&pixmap, x, y), 0, "pixel ({x}, {y})");
+            }
+        }
+
+        assert!(alpha(&pixmap, 16, 30) > 0, "shadow inside the clip");
+    }
+
+    #[test]
+    fn shadow_is_drawn_when_only_the_shadow_is_damaged() {
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(18.0, 64.0));
+        let pixmap = draw_shadowed_quad(clip);
+
+        assert!(alpha(&pixmap, 16, 30) > 0);
+        assert_eq!(alpha(&pixmap, 20, 30), 0);
+    }
+
+    #[test]
+    fn shadow_bounds_are_damaged() {
+        let quad = shadowed_quad();
+        let bounds = shadow_bounds(&quad);
+
+        assert_eq!(bounds.x, 12.0);
+        assert_eq!(bounds.width, 36.0);
+    }
+
+    #[cfg(feature = "image")]
+    fn draw_red_square(radius: f32) -> tiny_skia::Pixmap {
+        use crate::core::image;
+
+        let mut engine = Engine::new();
+        let mut pixmap = tiny_skia::Pixmap::new(32, 32).unwrap();
+        let mut mask = tiny_skia::Mask::new(32, 32).unwrap();
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(32.0, 32.0));
+        adjust_clip_mask(&mut mask, clip);
+
+        let handle =
+            image::Handle::from_rgba(16, 16, [255, 0, 0, 255].repeat(256));
+        let bounds =
+            Rectangle::new(Point::new(8.0, 8.0), Size::new(16.0, 16.0));
+
+        engine.draw_image(
+            &Image::Raster {
+                image: image::Image {
+                    border_radius: radius.into(),
+                    ..image::Image::new(handle)
+                },
+                bounds,
+                clip_bounds: bounds,
+            },
+            Transformation::IDENTITY,
+            &mut pixmap.as_mut(),
+            &mut mask,
+            clip,
+        );
+
+        pixmap
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn raster_border_radius_rounds_the_corners() {
+        let pixmap = draw_red_square(8.0);
+
+        assert_eq!(alpha(&pixmap, 8, 8), 0, "corner cut");
+        assert_eq!(alpha(&pixmap, 23, 23), 0, "corner cut");
+        let center = pixmap.pixel(16, 16).unwrap();
+        // iced's pixmaps are BGRA: red lands in tiny-skia's blue channel.
+        assert_eq!((center.blue(), center.alpha()), (255, 255));
+        assert_eq!(alpha(&pixmap, 16, 10), 255, "near the edge midpoint");
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn raster_without_radius_stays_square() {
+        let pixmap = draw_red_square(0.0);
+
+        assert_eq!(alpha(&pixmap, 8, 8), 255);
+        assert_eq!(alpha(&pixmap, 23, 23), 255);
+        assert_eq!(alpha(&pixmap, 7, 7), 0);
+    }
 }

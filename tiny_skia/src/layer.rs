@@ -218,7 +218,15 @@ impl Layer {
             &previous.quads,
             &current.quads,
             |(quad, _)| {
-                quad.bounds
+                // Include the shadow, or moving a shadowed quad leaves its
+                // old shadow behind.
+                let bounds = if quad.shadow.color.a > 0.0 {
+                    quad.bounds.union(&crate::engine::shadow_bounds(quad))
+                } else {
+                    quad.bounds
+                };
+
+                bounds
                     .expand(1.0)
                     .intersection(&current.bounds)
                     .into_iter()
