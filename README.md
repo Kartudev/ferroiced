@@ -1,15 +1,15 @@
 > **ferroiced** — fork of [iced](https://github.com/iced-rs/iced) maintained for
 > [Ferrocord](https://github.com/Dasemu/Ferrocord). It is iced **0.14.1**
-> (release commit `df71aa93b`) plus one change: a fast path for opaque raster
-> images in `iced_tiny_skia` (no premultiply for opaque pixels, row-copy blit
-> for 1:1 draws), used for in-app video. Crate names are unchanged so it can be
+> (release commit `df71aa93b`) plus changes to `iced_tiny_skia` only: a fast
+> path for opaque raster images (no premultiply for opaque pixels, row-copy
+> blit for 1:1 draws), used for in-app video, and two rendering fixes
+> (clipped shadows, rounded raster images). Crate names are unchanged so it can be
 > used via `[patch.crates-io]`. Not affiliated with or endorsed by the iced
 > project; all credit for iced goes to its authors (MIT, see `LICENSE`).
 >
 > ### What the fork changes, and what it buys
 >
-> One commit on top of 0.14.1 (`30bd32b`), touching only
-> `tiny_skia/src/raster.rs`:
+> **Fast path for opaque images** (`30bd32b`, `tiny_skia/src/raster.rs`):
 >
 > - `Handle::Rgba` pixels are converted directly, skipping `image::load` and
 >   its extra copy.
@@ -35,10 +35,24 @@
 > applies to unscaled draws. To hit it, scale frames to physical pixels
 > (logical bounds × scale factor) and draw with `FilterMethod::Nearest`.
 >
-> Not fixed here (still stock behaviour in `iced_tiny_skia` 0.14.1):
-> container shadows are drawn unclipped by the damage region, so on partial
-> redraws (Windows/softbuffer) they stack up and darken to black; and
-> `image(..).border_radius(..)` is ignored for raster images.
+> **Bug fixes over stock `iced_tiny_skia` 0.14.1** (both covered by pixel
+> tests in `tiny_skia/src/engine.rs`):
+>
+> - **Shadows no longer darken to black on partial redraws.** Stock iced
+>   draws a quad's shadow without the clip mask, so each partial redraw
+>   (scrolling, hover; visible on Windows, where softbuffer keeps the back
+>   buffer and only the damaged region is repainted) blends the
+>   semi-transparent shadow again over pixels outside the damage region until
+>   they turn black. The shadow is now clipped to the damage region and only
+>   its visible part is computed; it is drawn even when only the shadow (not
+>   the quad) is damaged; and damage tracking includes the shadow's extent,
+>   so a moving shadowed quad leaves no stale shadow behind.
+> - **`image(..).border_radius(..)` works for raster images.** Stock
+>   `iced_tiny_skia` ignores it and draws them square. The rounded rectangle
+>   is now filled with the image as a pattern (anti-aliased, honours opacity,
+>   filter method and the clip mask). Like `iced_wgpu`, the radius rounds the
+>   visible area: the image bounds cut by the widget bounds. Images without a
+>   radius take the unchanged path, including the fast path above.
 
 <div align="center">
 
