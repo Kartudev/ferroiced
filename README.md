@@ -5,6 +5,40 @@
 > for 1:1 draws), used for in-app video. Crate names are unchanged so it can be
 > used via `[patch.crates-io]`. Not affiliated with or endorsed by the iced
 > project; all credit for iced goes to its authors (MIT, see `LICENSE`).
+>
+> ### What the fork changes, and what it buys
+>
+> One commit on top of 0.14.1 (`30bd32b`), touching only
+> `tiny_skia/src/raster.rs`:
+>
+> - `Handle::Rgba` pixels are converted directly, skipping `image::load` and
+>   its extra copy.
+> - Fully opaque images skip premultiplication: a plain RGBA→BGRA swizzle the
+>   compiler vectorises, instead of a per-pixel premultiply loop.
+> - Opaque images drawn 1:1 (unscaled, unrotated, full opacity, no clip mask)
+>   are copied row by row into the target instead of going through
+>   `draw_pixmap`.
+>
+> Measured in Ferrocord's video prototype (Ryzen 9 7940HS, 1920×1080 at 125%
+> scaling, worst-case 33 Mbps H.264, release build, full frame rate kept in
+> every run; % of one CPU core):
+>
+> | Scenario (1080p60 fullscreen, 1:1) | stock `iced_tiny_skia` 0.14.1 | ferroiced |
+> |---|---|---|
+> | App + decoder, hardware decode (D3D11VA) | ~160% | **~108%** |
+> | App + decoder, software decode | ~180% | **~121%** |
+> | App / renderer thread alone | ~100% | **~50%** |
+>
+> Output is pixel-identical to stock (checked on Ferrocord's mock
+> screenshots). Small images gain little: a 270p15 clip in chat costs ~7% and
+> 1080p60 scaled to 400×225 ~30% either way, since the 1:1 row-copy path only
+> applies to unscaled draws. To hit it, scale frames to physical pixels
+> (logical bounds × scale factor) and draw with `FilterMethod::Nearest`.
+>
+> Not fixed here (still stock behaviour in `iced_tiny_skia` 0.14.1):
+> container shadows are drawn unclipped by the damage region, so on partial
+> redraws (Windows/softbuffer) they stack up and darken to black; and
+> `image(..).border_radius(..)` is ignored for raster images.
 
 <div align="center">
 
