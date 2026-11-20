@@ -58,6 +58,40 @@ impl Pipeline {
         let height_scale = bounds.height / image.height() as f32;
 
         let transform = transform.pre_scale(width_scale, height_scale);
+        let x = (bounds.x / width_scale) as i32;
+        let y = (bounds.y / height_scale) as i32;
+
+        // Fast path (Ferrocord video): an opaque image drawn 1:1, unrotated,
+        // fully opaque and unmasked is a plain row copy.
+        if opacity >= 1.0
+            && clip_mask.is_none()
+            && transform.kx == 0.0
+            && transform.ky == 0.0
+            && (transform.sx - 1.0).abs() < 1e-3
+            && (transform.sy - 1.0).abs() < 1e-3
+        {
+            let dx = x as f32 * transform.sx + transform.tx;
+            let dy = y as f32 * transform.sy + transform.ty;
+            if (dx - dx.round()).abs() < 1e-2 && (dy - dy.round()).abs() < 1e-2
+            {
+                if let Some(Some(entry)) = cache.entries.get(&handle.id()) {
+                    if entry.opaque
+                        && blit(
+                            entry,
+                            dx.round() as i64,
+                            dy.round() as i64,
+                            pixels,
+                        )
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let Ok(image) = cache.allocate(handle) else {
+            return;
+        };
 
         let quality = match filter_method {
             raster::FilterMethod::Linear => tiny_skia::FilterQuality::Bilinear,
@@ -65,8 +99,8 @@ impl Pipeline {
         };
 
         pixels.draw_pixmap(
-            (bounds.x / width_scale) as i32,
-            (bounds.y / height_scale) as i32,
+            x,
+            y,
             image,
             &tiny_skia::PixmapPaint {
                 quality,
@@ -97,35 +131,46 @@ impl Cache {
         let id = handle.id();
 
         if let hash_map::Entry::Vacant(entry) = self.entries.entry(id) {
-            let image = match graphics::image::load(handle) {
-                Ok(image) => image,
-                Err(error) => {
-                    let _ = entry.insert(None);
-
-                    return Err(error);
+            if let raster::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } = handle
+            {
+                if *width == 0 || *height == 0 {
+                    return Err(raster::Error::Empty);
                 }
-            };
+                let (buffer, opaque) = convert(pixels);
+                let _ = entry.insert(Some(Entry {
+                    width: *width,
+                    height: *height,
+                    pixels: buffer,
+                    opaque,
+                }));
+            } else {
+                let image = match graphics::image::load(handle) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        let _ = entry.insert(None);
 
-            if image.width() == 0 || image.height() == 0 {
-                return Err(raster::Error::Empty);
+                        return Err(error);
+                    }
+                };
+
+                if image.width() == 0 || image.height() == 0 {
+                    return Err(raster::Error::Empty);
+                }
+
+                let (buffer, opaque) = convert(image.as_raw());
+
+                let _ = entry.insert(Some(Entry {
+                    width: image.width(),
+                    height: image.height(),
+                    pixels: buffer,
+                    opaque,
+                }));
             }
-
-            let mut buffer =
-                vec![0u32; image.width() as usize * image.height() as usize];
-
-            for (i, pixel) in image.pixels().enumerate() {
-                let [r, g, b, a] = pixel.0;
-
-                buffer[i] = bytemuck::cast(
-                    tiny_skia::ColorU8::from_rgba(b, g, r, a).premultiply(),
-                );
-            }
-
-            let _ = entry.insert(Some(Entry {
-                width: image.width(),
-                height: image.height(),
-                pixels: buffer,
-            }));
         }
 
         let _ = self.hits.insert(id);
@@ -157,4 +202,55 @@ struct Entry {
     width: u32,
     height: u32,
     pixels: Vec<u32>,
+    opaque: bool,
+}
+
+/// RGBA bytes to tiny-skia's premultiplied BGRA words. Opaque images (video
+/// frames, most photos) skip premultiplication: a pure swizzle the compiler
+/// vectorises.
+fn convert(rgba: &[u8]) -> (Vec<u32>, bool) {
+    let opaque = rgba.chunks_exact(4).all(|p| p[3] == 255);
+    let buffer = if opaque {
+        rgba.chunks_exact(4)
+            .map(|p| u32::from_le_bytes([p[2], p[1], p[0], 255]))
+            .collect()
+    } else {
+        rgba.chunks_exact(4)
+            .map(|p| {
+                bytemuck::cast(
+                    tiny_skia::ColorU8::from_rgba(p[2], p[1], p[0], p[3])
+                        .premultiply(),
+                )
+            })
+            .collect()
+    };
+    (buffer, opaque)
+}
+
+/// Copies an opaque entry into `pixels` at (`x`, `y`), clipped to the
+/// target. Returns false if the target cannot be viewed as words.
+fn blit(
+    entry: &Entry,
+    x: i64,
+    y: i64,
+    pixels: &mut tiny_skia::PixmapMut<'_>,
+) -> bool {
+    let (tw, th) = (i64::from(pixels.width()), i64::from(pixels.height()));
+    let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, u32>(pixels.data_mut())
+    else {
+        return false;
+    };
+    let (w, h) = (i64::from(entry.width), i64::from(entry.height));
+    let (x0, x1) = (x.max(0), (x + w).min(tw));
+    let (y0, y1) = (y.max(0), (y + h).min(th));
+    if x0 >= x1 || y0 >= y1 {
+        return true;
+    }
+    let len = (x1 - x0) as usize;
+    for row in y0..y1 {
+        let src = ((row - y) * w + (x0 - x)) as usize;
+        let d = (row * tw + x0) as usize;
+        dst[d..d + len].copy_from_slice(&entry.pixels[src..src + len]);
+    }
+    true
 }
