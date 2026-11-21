@@ -6,6 +6,8 @@ use crate::core::{
 use crate::graphics::{Image, Text};
 use crate::text;
 
+use std::cell::Cell;
+
 #[derive(Debug)]
 pub struct Engine {
     text_pipeline: text::Pipeline,
@@ -158,62 +160,117 @@ impl Engine {
             }
         }
 
-        pixels.fill_path(
-            &path,
-            &tiny_skia::Paint {
-                shader: match background {
-                    Background::Color(color) => {
-                        tiny_skia::Shader::SolidColor(into_color(*color))
-                    }
-                    Background::Gradient(Gradient::Linear(linear)) => {
-                        let (start, end) =
-                            linear.angle.to_distance(&quad.bounds);
+        // Only rasterize what can be seen. A square quad (or one whose
+        // rounded corners all lie outside the clip) is cut to the clip, and
+        // an opaque solid one is written directly but for its edges.
+        let square = fill_border_radius.iter().all(|radius| *radius == 0.0)
+            || (clip_mask.is_some()
+                && corners_outside(
+                    physical_bounds,
+                    fill_border_radius,
+                    transformation.scale_factor(),
+                    clip_bounds.expand(1.0),
+                ));
 
-                        let stops: Vec<tiny_skia::GradientStop> = linear
-                            .stops
-                            .into_iter()
-                            .flatten()
-                            .map(|stop| {
-                                tiny_skia::GradientStop::new(
-                                    stop.offset,
-                                    tiny_skia::Color::from_rgba(
-                                        stop.color.b,
-                                        stop.color.g,
-                                        stop.color.r,
-                                        stop.color.a,
+        let opaque_color = match background {
+            Background::Color(color) if color.a >= 1.0 => Some(*color),
+            _ => None,
+        };
+
+        let path = match (square, opaque_color) {
+            (true, Some(color)) => {
+                let region = if clip_mask.is_some() {
+                    pixel_rect(clip_bounds, pixels.width(), pixels.height())
+                } else {
+                    [0, 0, pixels.width() as i32, pixels.height() as i32]
+                };
+
+                fill_opaque_rect(
+                    pixels,
+                    quad.bounds,
+                    transformation,
+                    color,
+                    region,
+                    clip_mask,
+                );
+
+                None
+            }
+            (true, None) if clip_mask.is_some() => {
+                let scale = transformation.scale_factor();
+                let translation = transformation.translation();
+                let clip = Rectangle {
+                    x: (clip_bounds.x - translation.x) / scale - 1.0,
+                    y: (clip_bounds.y - translation.y) / scale - 1.0,
+                    width: clip_bounds.width / scale + 2.0,
+                    height: clip_bounds.height / scale + 2.0,
+                };
+
+                quad.bounds
+                    .intersection(&clip)
+                    .map(|visible| rounded_rectangle(visible, [0.0; 4]))
+            }
+            _ => Some(path),
+        };
+
+        if let Some(path) = path {
+            pixels.fill_path(
+                &path,
+                &tiny_skia::Paint {
+                    shader: match background {
+                        Background::Color(color) => {
+                            tiny_skia::Shader::SolidColor(into_color(*color))
+                        }
+                        Background::Gradient(Gradient::Linear(linear)) => {
+                            let (start, end) =
+                                linear.angle.to_distance(&quad.bounds);
+
+                            let stops: Vec<tiny_skia::GradientStop> = linear
+                                .stops
+                                .into_iter()
+                                .flatten()
+                                .map(|stop| {
+                                    tiny_skia::GradientStop::new(
+                                        stop.offset,
+                                        tiny_skia::Color::from_rgba(
+                                            stop.color.b,
+                                            stop.color.g,
+                                            stop.color.r,
+                                            stop.color.a,
+                                        )
+                                        .expect("Create color"),
                                     )
-                                    .expect("Create color"),
-                                )
-                            })
-                            .collect();
+                                })
+                                .collect();
 
-                        tiny_skia::LinearGradient::new(
-                            tiny_skia::Point {
-                                x: start.x,
-                                y: start.y,
-                            },
-                            tiny_skia::Point { x: end.x, y: end.y },
-                            if stops.is_empty() {
-                                vec![tiny_skia::GradientStop::new(
-                                    0.0,
-                                    tiny_skia::Color::BLACK,
-                                )]
-                            } else {
-                                stops
-                            },
-                            tiny_skia::SpreadMode::Pad,
-                            tiny_skia::Transform::identity(),
-                        )
-                        .expect("Create linear gradient")
-                    }
+                            tiny_skia::LinearGradient::new(
+                                tiny_skia::Point {
+                                    x: start.x,
+                                    y: start.y,
+                                },
+                                tiny_skia::Point { x: end.x, y: end.y },
+                                if stops.is_empty() {
+                                    vec![tiny_skia::GradientStop::new(
+                                        0.0,
+                                        tiny_skia::Color::BLACK,
+                                    )]
+                                } else {
+                                    stops
+                                },
+                                tiny_skia::SpreadMode::Pad,
+                                tiny_skia::Transform::identity(),
+                            )
+                            .expect("Create linear gradient")
+                        }
+                    },
+                    anti_alias: true,
+                    ..tiny_skia::Paint::default()
                 },
-                anti_alias: true,
-                ..tiny_skia::Paint::default()
-            },
-            tiny_skia::FillRule::EvenOdd,
-            transform,
-            clip_mask,
-        );
+                tiny_skia::FillRule::EvenOdd,
+                transform,
+                clip_mask,
+            );
+        }
 
         if border_width > 0.0 {
             // Border path is offset by half the border width
@@ -336,7 +393,7 @@ impl Engine {
         text: &Text,
         transformation: Transformation,
         pixels: &mut tiny_skia::PixmapMut<'_>,
-        clip_mask: &mut tiny_skia::Mask,
+        _clip_mask: &mut tiny_skia::Mask,
         clip_bounds: Rectangle,
     ) {
         match text {
@@ -362,20 +419,15 @@ impl Engine {
                     return;
                 }
 
-                let clip_mask = match physical_bounds.is_within(&clip_bounds) {
-                    true => None,
-                    false => {
-                        adjust_clip_mask(clip_mask, clip_bounds);
-                        Some(clip_mask as &_)
-                    }
-                };
+                let clip = (!physical_bounds.is_within(&clip_bounds))
+                    .then_some(clip_bounds);
 
                 self.text_pipeline.draw_paragraph(
                     paragraph,
                     *position,
                     *color,
                     pixels,
-                    clip_mask,
+                    clip,
                     transformation,
                 );
             }
@@ -400,20 +452,15 @@ impl Engine {
                     return;
                 }
 
-                let clip_mask = match physical_bounds.is_within(&clip_bounds) {
-                    true => None,
-                    false => {
-                        adjust_clip_mask(clip_mask, clip_bounds);
-                        Some(clip_mask as &_)
-                    }
-                };
+                let clip = (!physical_bounds.is_within(&clip_bounds))
+                    .then_some(clip_bounds);
 
                 self.text_pipeline.draw_editor(
                     editor,
                     *position,
                     *color,
                     pixels,
-                    clip_mask,
+                    clip,
                     transformation,
                 );
             }
@@ -435,13 +482,8 @@ impl Engine {
                     return;
                 }
 
-                let clip_mask = match physical_bounds.is_within(&clip_bounds) {
-                    true => None,
-                    false => {
-                        adjust_clip_mask(clip_mask, clip_bounds);
-                        Some(clip_mask as &_)
-                    }
-                };
+                let clip = (!physical_bounds.is_within(&clip_bounds))
+                    .then_some(clip_bounds);
 
                 self.text_pipeline.draw_cached(
                     content,
@@ -454,7 +496,7 @@ impl Engine {
                     *align_y,
                     *shaping,
                     pixels,
-                    clip_mask,
+                    clip,
                     transformation,
                 );
             }
@@ -481,15 +523,15 @@ impl Engine {
                     return;
                 }
 
-                let clip_mask = (!physical_bounds.is_within(&clip_bounds))
-                    .then_some(clip_mask as &_);
+                let clip = (!physical_bounds.is_within(&clip_bounds))
+                    .then_some(clip_bounds);
 
                 self.text_pipeline.draw_raw(
                     &buffer,
                     raw.position,
                     raw.color,
                     pixels,
-                    clip_mask,
+                    clip,
                     transformation,
                 );
             }
@@ -589,6 +631,9 @@ impl Engine {
 
                 let clip_mask = (!physical_bounds.is_within(&_clip_bounds))
                     .then_some(_clip_mask as &_);
+                let clip_rect = clip_mask.map(|_| {
+                    pixel_rect(_clip_bounds, _pixels.width(), _pixels.height())
+                });
 
                 let center = physical_bounds.center();
                 let radians = f32::from(image.rotation);
@@ -609,6 +654,7 @@ impl Engine {
                     _pixels,
                     transform,
                     clip_mask,
+                    clip_rect,
                 );
             }
             #[cfg(feature = "svg")]
@@ -865,36 +911,430 @@ fn rounded_box_sdf(
     (x.powf(2.0) + y.powf(2.0)).sqrt() - radius
 }
 
-pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
-    clip_mask.clear();
-
-    let path = {
-        let mut builder = tiny_skia::PathBuilder::new();
-        builder.push_rect(
-            tiny_skia::Rect::from_xywh(
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
-            )
-            .unwrap(),
-        );
-
-        builder.finish().unwrap()
+/// The pixels a non-anti-aliased fill of `bounds` covers (those whose
+/// centre lies inside), as `[x0, y0, x1, y1]` clamped to `width`x`height`.
+/// The clip mask covers exactly this rectangle, so code that clips with it
+/// matches code that clips with the mask.
+pub(crate) fn pixel_rect(
+    bounds: Rectangle,
+    width: u32,
+    height: u32,
+) -> [i32; 4] {
+    let round = |value: f32, max: u32| {
+        ((value + 0.5).floor() as i64).clamp(0, i64::from(max)) as i32
     };
 
-    clip_mask.fill_path(
-        &path,
-        tiny_skia::FillRule::EvenOdd,
-        false,
-        tiny_skia::Transform::default(),
-    );
+    let x0 = round(bounds.x, width);
+    let y0 = round(bounds.y, height);
+    let x1 = round(bounds.x + bounds.width, width).max(x0);
+    let y1 = round(bounds.y + bounds.height, height).max(y0);
+
+    [x0, y0, x1, y1]
+}
+
+thread_local! {
+    /// The mask last written by `adjust_clip_mask` (data pointer and size)
+    /// and the only rectangle of it that is not zero.
+    static CLIP_MASK_RECT: Cell<Option<(usize, u32, u32, [i32; 4])>> =
+        const { Cell::new(None) };
+}
+
+/// Makes `clip_mask` cover exactly `bounds` (see [`pixel_rect`]). Only the
+/// previous and the new rectangle are touched, instead of the whole mask.
+pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
+    let (width, height) = (clip_mask.width(), clip_mask.height());
+    let rect = pixel_rect(bounds, width, height);
+    let key = (clip_mask.data().as_ptr() as usize, width, height);
+    let stride = width as usize;
+
+    let fill = |data: &mut [u8], [x0, y0, x1, y1]: [i32; 4], value: u8| {
+        if x0 >= x1 {
+            return;
+        }
+
+        for row in y0..y1 {
+            let start = row as usize * stride;
+            data[start + x0 as usize..start + x1 as usize].fill(value);
+        }
+    };
+
+    match CLIP_MASK_RECT.get() {
+        Some((ptr, w, h, previous)) if (ptr, w, h) == key => {
+            if previous == rect {
+                return;
+            }
+
+            fill(clip_mask.data_mut(), previous, 0);
+        }
+        _ => clip_mask.clear(),
+    }
+
+    fill(clip_mask.data_mut(), rect, 255);
+    CLIP_MASK_RECT.set(Some((key.0, key.1, key.2, rect)));
+}
+
+/// Whether every rounded corner of `bounds` (physical) lies outside `clip`,
+/// so that inside `clip` the quad is a plain rectangle.
+fn corners_outside(
+    bounds: Rectangle,
+    radii: [f32; 4],
+    scale: f32,
+    clip: Rectangle,
+) -> bool {
+    let [top_left, top_right, bottom_right, bottom_left] =
+        radii.map(|radius| radius * scale);
+    let right = bounds.x + bounds.width;
+    let bottom = bounds.y + bounds.height;
+
+    [
+        (top_left, bounds.x, bounds.y),
+        (top_right, right - top_right, bounds.y),
+        (bottom_right, right - bottom_right, bottom - bottom_right),
+        (bottom_left, bounds.x, bottom - bottom_left),
+    ]
+    .into_iter()
+    .all(|(radius, x, y)| {
+        radius <= 0.0
+            || !clip.intersects(&Rectangle {
+                x,
+                y,
+                width: radius,
+                height: radius,
+            })
+    })
+}
+
+/// Fills an opaque, square quad inside `region` (a pixel rectangle): fully
+/// covered pixels are written directly and only the anti-aliased edge
+/// strips go through tiny-skia, giving the same pixels as filling the
+/// whole quad path (through `clip_mask`, which covers `region`).
+fn fill_opaque_rect(
+    pixels: &mut tiny_skia::PixmapMut<'_>,
+    bounds: Rectangle,
+    transformation: Transformation,
+    color: Color,
+    region: [i32; 4],
+    clip_mask: Option<&tiny_skia::Mask>,
+) {
+    // Transform the corners the way tiny-skia transforms path points.
+    let transform = into_transform(transformation);
+    let left = bounds.x * transform.sx + transform.tx;
+    let top = bounds.y * transform.sy + transform.ty;
+    let right = (bounds.x + bounds.width) * transform.sx + transform.tx;
+    let bottom = (bounds.y + bounds.height) * transform.sy + transform.ty;
+
+    let [rx0, ry0, rx1, ry1] = region;
+    let outer = [
+        (left.floor() as i32).max(rx0),
+        (top.floor() as i32).max(ry0),
+        (right.ceil() as i32).min(rx1),
+        (bottom.ceil() as i32).min(ry1),
+    ];
+
+    if outer[0] >= outer[2] || outer[1] >= outer[3] {
+        return;
+    }
+
+    let inner = [
+        (left.ceil() as i32).max(outer[0]),
+        (top.ceil() as i32).max(outer[1]),
+        (right.floor() as i32).min(outer[2]),
+        (bottom.floor() as i32).min(outer[3]),
+    ];
+
+    let paint = tiny_skia::Paint {
+        shader: tiny_skia::Shader::SolidColor(into_color(color)),
+        anti_alias: true,
+        ..tiny_skia::Paint::default()
+    };
+
+    let mut edge = |[x0, y0, x1, y1]: [i32; 4]| {
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let Some(rect) = tiny_skia::Rect::from_ltrb(
+            left.max(x0 as f32),
+            top.max(y0 as f32),
+            right.min(x1 as f32),
+            bottom.min(y1 as f32),
+        ) else {
+            return;
+        };
+
+        // Keep the mask whenever stock iced used it: it also selects
+        // tiny-skia's f32 pipeline, which rounds differently.
+        pixels.fill_path(
+            &tiny_skia::PathBuilder::from_rect(rect),
+            &paint,
+            tiny_skia::FillRule::EvenOdd,
+            tiny_skia::Transform::identity(),
+            clip_mask,
+        );
+    };
+
+    if inner[0] >= inner[2] || inner[1] >= inner[3] {
+        edge(outer);
+        return;
+    }
+
+    edge([outer[0], outer[1], outer[2], inner[1]]);
+    edge([outer[0], inner[3], outer[2], outer[3]]);
+    edge([outer[0], inner[1], inner[0], inner[3]]);
+    edge([inner[2], inner[1], outer[2], inner[3]]);
+
+    // Fully covered and opaque, the result is the colour itself, rounded
+    // like the pipeline tiny-skia picks: f32 (round half to even) with a
+    // mask, 8-bit (round half up) without.
+    let premultiplied = into_color(color).premultiply();
+    let value: u32 = if clip_mask.is_some() {
+        let channel =
+            |c: f32| (c.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
+
+        u32::from_le_bytes([
+            channel(premultiplied.red()),
+            channel(premultiplied.green()),
+            channel(premultiplied.blue()),
+            channel(premultiplied.alpha()),
+        ])
+    } else {
+        bytemuck::cast(premultiplied.to_color_u8())
+    };
+    let stride = pixels.width() as usize;
+    let Ok(data) = bytemuck::try_cast_slice_mut::<u8, u32>(pixels.data_mut())
+    else {
+        return;
+    };
+
+    for row in inner[1]..inner[3] {
+        let start = row as usize * stride;
+        data[start + inner[0] as usize..start + inner[2] as usize].fill(value);
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::{Border, Point, Shadow};
+
+    /// Deterministic pseudo-random numbers in `[0, 1)`.
+    pub(crate) struct Lcg(pub u64);
+
+    impl Lcg {
+        pub(crate) fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 40) as f32) / (1u64 << 24) as f32
+        }
+
+        /// A random premultiplied pixel.
+        pub(crate) fn pixel(&mut self) -> [u8; 4] {
+            let a = (self.next() * 256.0) as u8;
+            let mut channel =
+                || ((self.next() * 256.0) as u16 * u16::from(a) / 255) as u8;
+            [channel(), channel(), channel(), a]
+        }
+    }
+
+    /// The clip mask as stock iced built it: a non-anti-aliased rect fill.
+    pub(crate) fn reference_mask(
+        width: u32,
+        height: u32,
+        bounds: Rectangle,
+    ) -> tiny_skia::Mask {
+        let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+        mask.fill_path(
+            &tiny_skia::PathBuilder::from_rect(
+                tiny_skia::Rect::from_xywh(
+                    bounds.x,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height,
+                )
+                .unwrap(),
+            ),
+            tiny_skia::FillRule::EvenOdd,
+            false,
+            tiny_skia::Transform::default(),
+        );
+        mask
+    }
+
+    pub(crate) fn noise(
+        width: u32,
+        height: u32,
+        seed: u64,
+    ) -> tiny_skia::Pixmap {
+        let mut rng = Lcg(seed);
+        let data = (0..width * height).flat_map(|_| rng.pixel()).collect();
+        tiny_skia::Pixmap::from_vec(
+            data,
+            tiny_skia::IntSize::from_wh(width, height).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Fails with the first differing pixel, if any.
+    pub(crate) fn assert_same_pixels(
+        expected: &tiny_skia::Pixmap,
+        actual: &tiny_skia::Pixmap,
+        context: &str,
+    ) {
+        let first = expected
+            .pixels()
+            .iter()
+            .zip(actual.pixels())
+            .position(|(a, b)| a != b);
+
+        if let Some(i) = first {
+            let width = expected.width() as usize;
+            panic!(
+                "{context}: pixel ({}, {}) is {:?}, expected {:?}",
+                i % width,
+                i / width,
+                actual.pixels()[i],
+                expected.pixels()[i],
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_rect_matches_the_mask() {
+        let mut rng = Lcg(1);
+        for _ in 0..500 {
+            let bounds = Rectangle {
+                x: rng.next() * 60.0 - 10.0,
+                y: rng.next() * 60.0 - 10.0,
+                width: rng.next() * 40.0 + 0.01,
+                height: rng.next() * 40.0 + 0.01,
+            };
+            let mask = reference_mask(48, 40, bounds);
+            let [x0, y0, x1, y1] = pixel_rect(bounds, 48, 40);
+            for y in 0..40 {
+                for x in 0..48 {
+                    let inside = x >= x0 && x < x1 && y >= y0 && y < y1;
+                    let value = mask.data()[(y * 48 + x) as usize];
+                    assert_eq!(
+                        value == 255,
+                        inside,
+                        "{bounds:?} at ({x}, {y})"
+                    );
+                    assert!(value == 0 || value == 255);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_clip_mask_matches_a_fresh_one() {
+        let mut rng = Lcg(2);
+        let mut mask = tiny_skia::Mask::new(64, 48).unwrap();
+        for _ in 0..200 {
+            let bounds = Rectangle {
+                x: rng.next() * 70.0 - 5.0,
+                y: rng.next() * 50.0 - 5.0,
+                width: rng.next() * 50.0 + 0.01,
+                height: rng.next() * 40.0 + 0.01,
+            };
+            adjust_clip_mask(&mut mask, bounds);
+            assert_eq!(
+                mask.data(),
+                reference_mask(64, 48, bounds).data(),
+                "{bounds:?}"
+            );
+        }
+    }
+
+    /// Draws `quad` with `Engine::draw_quad` and the way stock iced did
+    /// (whole path through the mask) on the same noisy background.
+    fn compare_quad(
+        quad: &Quad,
+        background: Background,
+        scale: f32,
+        clip: Rectangle,
+    ) {
+        let (width, height) = (96, 80);
+        let transformation = Transformation::scale(scale);
+        let physical = quad.bounds * transformation;
+
+        let mut expected = noise(width, height, 3);
+        let mask = reference_mask(width, height, clip);
+        let radii = <[f32; 4]>::from(quad.border.radius).map(|r| {
+            r.min(quad.bounds.width / 2.0).min(quad.bounds.height / 2.0)
+        });
+        if clip.intersects(&physical) {
+            let Background::Color(color) = background else {
+                unreachable!()
+            };
+            expected.fill_path(
+                &rounded_rectangle(quad.bounds, radii),
+                &tiny_skia::Paint {
+                    shader: tiny_skia::Shader::SolidColor(into_color(color)),
+                    anti_alias: true,
+                    ..tiny_skia::Paint::default()
+                },
+                tiny_skia::FillRule::EvenOdd,
+                into_transform(transformation),
+                (!physical.is_within(&clip)).then_some(&mask),
+            );
+        }
+
+        let mut actual = noise(width, height, 3);
+        let mut clip_mask = tiny_skia::Mask::new(width, height).unwrap();
+        adjust_clip_mask(&mut clip_mask, clip);
+        Engine::new().draw_quad(
+            quad,
+            &background,
+            transformation,
+            &mut actual.as_mut(),
+            &mut clip_mask,
+            clip,
+        );
+
+        assert_same_pixels(
+            &expected,
+            &actual,
+            &format!(
+                "quad {:?} radius {:?} scale {scale} clip {clip:?}",
+                quad.bounds, quad.border.radius
+            ),
+        );
+    }
+
+    #[test]
+    fn visible_quad_fills_match_stock() {
+        let mut rng = Lcg(4);
+        for i in 0..400 {
+            let scale = [1.0, 1.25, 1.5, 2.0][i % 4];
+            let bounds = Rectangle {
+                x: (rng.next() * 50.0 - 5.0).round() + [0.0, 0.25, 0.5][i % 3],
+                y: (rng.next() * 40.0 - 5.0).round() + [0.0, 0.75, 0.4][i % 3],
+                width: rng.next() * 40.0 + 0.2,
+                height: rng.next() * 40.0 + 0.2,
+            };
+            let clip = Rectangle {
+                x: rng.next() * 60.0,
+                y: rng.next() * 50.0,
+                width: rng.next() * 70.0 + 1.0,
+                height: rng.next() * 60.0 + 1.0,
+            };
+            let radius = if i % 3 == 0 { rng.next() * 12.0 } else { 0.0 };
+            let quad = Quad {
+                bounds,
+                border: Border {
+                    radius: radius.into(),
+                    ..Border::default()
+                },
+                ..Quad::default()
+            };
+            let alpha = if i % 5 == 0 { 0.6 } else { 1.0 };
+            let color =
+                Color::from_rgba(rng.next(), rng.next(), rng.next(), alpha);
+            compare_quad(&quad, Background::Color(color), scale, clip);
+        }
+    }
 
     fn alpha(pixmap: &tiny_skia::Pixmap, x: u32, y: u32) -> u8 {
         pixmap

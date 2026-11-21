@@ -1,4 +1,4 @@
-use crate::core::{Color, Rectangle, Size};
+use crate::core::{Color, Rectangle, Size, Transformation};
 use crate::graphics::compositor::{self, Information};
 use crate::graphics::damage;
 use crate::graphics::error::{self, Error};
@@ -186,6 +186,10 @@ pub fn present(
         })
         .unwrap_or_else(|| vec![Rectangle::with_size(viewport.logical_size())]);
 
+    // Regions sent to the window: only what was redrawn. A redraw with no
+    // damage (an expose, say) still presents the whole buffer.
+    let mut present_damage = Vec::new();
+
     if damage.is_empty() {
         if let Some(last_layers) = last_layers {
             surface.layer_stack.push_front(last_layers.clone());
@@ -197,6 +201,13 @@ pub fn present(
         let damage = damage::group(
             damage,
             Rectangle::with_size(viewport.logical_size()),
+        );
+
+        present_damage = physical_damage(
+            &damage,
+            viewport.scale_factor(),
+            physical_size.width,
+            physical_size.height,
         );
 
         let mut pixels = tiny_skia::PixmapMut::from_bytes(
@@ -216,7 +227,53 @@ pub fn present(
     }
 
     on_pre_present();
-    buffer.present().map_err(|_| compositor::SurfaceError::Lost)
+
+    if present_damage.is_empty() || full_present() {
+        buffer.present()
+    } else {
+        buffer.present_with_damage(&present_damage)
+    }
+    .map_err(|_| compositor::SurfaceError::Lost)
+}
+
+/// `FERROICED_FULL_PRESENT=1` always presents the whole window, for X11
+/// setups without a compositor that need exposed areas repainted.
+fn full_present() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    *FULL.get_or_init(|| {
+        std::env::var_os("FERROICED_FULL_PRESENT")
+            .is_some_and(|value| value != "0")
+    })
+}
+
+/// Logical damage rectangles as whole physical pixels inside the surface.
+fn physical_damage(
+    damage: &[Rectangle],
+    scale_factor: f32,
+    width: u32,
+    height: u32,
+) -> Vec<softbuffer::Rect> {
+    damage
+        .iter()
+        .filter_map(|region| {
+            let region = *region * Transformation::scale(scale_factor);
+
+            let x0 = (region.x.floor().max(0.0) as u32).min(width);
+            let y0 = (region.y.floor().max(0.0) as u32).min(height);
+            let x1 =
+                ((region.x + region.width).ceil().max(0.0) as u32).min(width);
+            let y1 =
+                ((region.y + region.height).ceil().max(0.0) as u32).min(height);
+
+            Some(softbuffer::Rect {
+                x: x0,
+                y: y0,
+                width: NonZeroU32::new(x1.saturating_sub(x0))?,
+                height: NonZeroU32::new(y1.saturating_sub(y0))?,
+            })
+        })
+        .collect()
 }
 
 pub fn screenshot(
@@ -265,4 +322,27 @@ pub fn screenshot(
             acc
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Point;
+
+    #[test]
+    fn damage_is_rounded_out_to_physical_pixels() {
+        let damage = [
+            Rectangle::new(Point::new(10.3, 4.9), Size::new(2.2, 1.0)),
+            Rectangle::new(Point::new(-5.0, 90.0), Size::new(20.0, 50.0)),
+            Rectangle::new(Point::new(200.0, 30.0), Size::new(10.0, 5.0)),
+        ];
+
+        let rects = physical_damage(&damage, 1.25, 100, 120);
+
+        assert_eq!(rects.len(), 2);
+        assert_eq!((rects[0].x, rects[0].y), (12, 6));
+        assert_eq!((rects[0].width.get(), rects[0].height.get()), (4, 2));
+        assert_eq!((rects[1].x, rects[1].y), (0, 112));
+        assert_eq!((rects[1].width.get(), rects[1].height.get()), (19, 8));
+    }
 }

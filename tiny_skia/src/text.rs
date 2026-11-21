@@ -42,7 +42,7 @@ impl Pipeline {
         position: Point,
         color: Color,
         pixels: &mut tiny_skia::PixmapMut<'_>,
-        clip_mask: Option<&tiny_skia::Mask>,
+        clip: Option<Rectangle>,
         transformation: Transformation,
     ) {
         let Some(paragraph) = paragraph.upgrade() else {
@@ -58,7 +58,7 @@ impl Pipeline {
             position,
             color,
             pixels,
-            clip_mask,
+            clip,
             transformation,
         );
     }
@@ -69,7 +69,7 @@ impl Pipeline {
         position: Point,
         color: Color,
         pixels: &mut tiny_skia::PixmapMut<'_>,
-        clip_mask: Option<&tiny_skia::Mask>,
+        clip: Option<Rectangle>,
         transformation: Transformation,
     ) {
         let Some(editor) = editor.upgrade() else {
@@ -85,7 +85,7 @@ impl Pipeline {
             position,
             color,
             pixels,
-            clip_mask,
+            clip,
             transformation,
         );
     }
@@ -102,7 +102,7 @@ impl Pipeline {
         align_y: alignment::Vertical,
         shaping: Shaping,
         pixels: &mut tiny_skia::PixmapMut<'_>,
-        clip_mask: Option<&tiny_skia::Mask>,
+        clip: Option<Rectangle>,
         transformation: Transformation,
     ) {
         let line_height = f32::from(line_height);
@@ -146,7 +146,7 @@ impl Pipeline {
             Point::new(x, y),
             color,
             pixels,
-            clip_mask,
+            clip,
             transformation,
         );
     }
@@ -157,7 +157,7 @@ impl Pipeline {
         position: Point,
         color: Color,
         pixels: &mut tiny_skia::PixmapMut<'_>,
-        clip_mask: Option<&tiny_skia::Mask>,
+        clip: Option<Rectangle>,
         transformation: Transformation,
     ) {
         let mut font_system = font_system().write().expect("Write font system");
@@ -169,7 +169,7 @@ impl Pipeline {
             position,
             color,
             pixels,
-            clip_mask,
+            clip,
             transformation,
         );
     }
@@ -187,14 +187,30 @@ fn draw(
     position: Point,
     color: Color,
     pixels: &mut tiny_skia::PixmapMut<'_>,
-    clip_mask: Option<&tiny_skia::Mask>,
+    clip: Option<Rectangle>,
     transformation: Transformation,
 ) {
     let position = position * transformation;
 
+    // The same pixels the clip mask would cover (see `pixel_rect`), so
+    // glyphs can be clipped, culled and blended without the mask.
+    let clip = clip.map_or(
+        [0, 0, pixels.width() as i32, pixels.height() as i32],
+        |bounds| {
+            crate::engine::pixel_rect(bounds, pixels.width(), pixels.height())
+        },
+    );
+
+    if clip[0] >= clip[2] || clip[1] >= clip[3] {
+        return;
+    }
+
     let mut swash = cosmic_text::SwashCache::new();
 
     for run in buffer.layout_runs() {
+        let line_y =
+            (run.line_y * transformation.scale_factor()).round() as i32;
+
         for glyph in run.glyphs {
             let physical_glyph = glyph.physical(
                 (position.x, position.y),
@@ -207,32 +223,98 @@ fn draw(
                 font_system,
                 &mut swash,
             ) {
-                let pixmap = tiny_skia::PixmapRef::from_bytes(
-                    buffer,
-                    placement.width,
-                    placement.height,
-                )
-                .expect("Create glyph pixel map");
-
                 let opacity = color.a
                     * glyph
                         .color_opt
                         .map(|c| c.a() as f32 / 255.0)
                         .unwrap_or(1.0);
 
-                pixels.draw_pixmap(
+                blend_glyph(
+                    pixels,
+                    buffer,
+                    placement.width as i32,
+                    placement.height as i32,
                     physical_glyph.x + placement.left,
-                    physical_glyph.y - placement.top
-                        + (run.line_y * transformation.scale_factor()).round()
-                            as i32,
-                    pixmap,
-                    &tiny_skia::PixmapPaint {
-                        opacity,
-                        ..tiny_skia::PixmapPaint::default()
-                    },
-                    tiny_skia::Transform::identity(),
-                    clip_mask,
+                    physical_glyph.y - placement.top + line_y,
+                    opacity,
+                    clip,
                 );
+            }
+        }
+    }
+}
+
+/// Draws a premultiplied glyph sprite at (`x`, `y`) with source-over,
+/// clipped to `clip` (`[x0, y0, x1, y1]`). This is the arithmetic of
+/// tiny-skia's `draw_pixmap` with an identity transform (its f32 pipeline:
+/// `Gather` has no low-precision stage), so the pixels are the same; it
+/// just avoids building a raster pipeline for every glyph.
+#[allow(clippy::too_many_arguments)]
+fn blend_glyph(
+    pixels: &mut tiny_skia::PixmapMut<'_>,
+    sprite: &[u8],
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    opacity: f32,
+    clip: [i32; 4],
+) {
+    // tiny-skia draws nothing for a transparent paint.
+    if opacity <= 0.0 {
+        return;
+    }
+
+    let x0 = x.max(clip[0]);
+    let y0 = y.max(clip[1]);
+    let x1 = (x + width).min(clip[2]);
+    let y1 = (y + height).min(clip[3]);
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    const FACTOR: f32 = 1.0 / 255.0;
+    let opacity = opacity.min(1.0);
+    let stride = pixels.width() as usize;
+    let data = pixels.data_mut();
+
+    for row in y0..y1 {
+        let source = ((row - y) * width + (x0 - x)) as usize * 4;
+        let target = (row as usize * stride + x0 as usize) * 4;
+        let len = (x1 - x0) as usize * 4;
+
+        let source = &sprite[source..source + len];
+        let target = &mut data[target..target + len];
+
+        for (src, dst) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(target.as_chunks_mut::<4>().0)
+        {
+            if src[3] == 0 {
+                continue;
+            }
+
+            let mut s = [
+                f32::from(src[0]) * FACTOR,
+                f32::from(src[1]) * FACTOR,
+                f32::from(src[2]) * FACTOR,
+                f32::from(src[3]) * FACTOR,
+            ];
+
+            if opacity < 1.0 {
+                for channel in &mut s {
+                    *channel *= opacity;
+                }
+            }
+
+            let inverse = 1.0 - s[3];
+
+            for (&s, d) in s.iter().zip(dst.iter_mut()) {
+                let value = (f32::from(*d) * FACTOR) * inverse + s;
+                *d = (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
             }
         }
     }
@@ -243,6 +325,13 @@ fn from_color(color: cosmic_text::Color) -> Color {
 
     Color::from_rgba8(r, g, b, a as f32 / 255.0)
 }
+
+const EMPTY_PLACEMENT: cosmic_text::Placement = cosmic_text::Placement {
+    left: 0,
+    top: 0,
+    width: 0,
+    height: 0,
+};
 
 #[derive(Debug, Clone, Default)]
 struct GlyphCache {
@@ -274,12 +363,22 @@ impl GlyphCache {
 
         if let hash_map::Entry::Vacant(entry) = self.entries.entry(key) {
             // TODO: Outline support
-            let image = swash.get_image_uncached(font_system, cache_key)?;
+            let Some(image) = swash.get_image_uncached(font_system, cache_key)
+            else {
+                // Remember glyphs without an image too: otherwise they are
+                // rasterized again on every frame.
+                let _ = entry.insert((Vec::new(), EMPTY_PLACEMENT));
+                let _ = self.recently_used.insert(key);
+                return None;
+            };
 
             let glyph_size = image.placement.width as usize
                 * image.placement.height as usize;
 
             if glyph_size == 0 {
+                // Same for empty glyphs (spaces).
+                let _ = entry.insert((Vec::new(), image.placement));
+                let _ = self.recently_used.insert(key);
                 return None;
             }
 
@@ -337,9 +436,12 @@ impl GlyphCache {
 
         let _ = self.recently_used.insert(key);
 
-        self.entries.get(&key).map(|(buffer, placement)| {
-            (bytemuck::cast_slice(buffer.as_slice()), *placement)
-        })
+        self.entries
+            .get(&key)
+            .filter(|(buffer, _)| !buffer.is_empty())
+            .map(|(buffer, placement)| {
+                (bytemuck::cast_slice(buffer.as_slice()), *placement)
+            })
     }
 
     pub fn trim(&mut self) {
@@ -358,5 +460,114 @@ impl GlyphCache {
         } else {
             self.trim_count += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::{Lcg, reference_mask};
+
+    #[test]
+    fn glyph_blending_matches_draw_pixmap() {
+        let mut rng = Lcg(7);
+        for case in 0..300 {
+            let gw = 1 + (rng.next() * 14.0) as u32;
+            let gh = 1 + (rng.next() * 14.0) as u32;
+            let sprite: Vec<u8> = (0..gw * gh)
+                .flat_map(|_| match case % 3 {
+                    0 if rng.next() < 0.7 => {
+                        let [r, g, b, _] = rng.pixel();
+                        [r, g, b, 255]
+                    }
+                    1 if rng.next() < 0.7 => [0, 0, 0, 0],
+                    _ => rng.pixel(),
+                })
+                .collect();
+            let glyph =
+                tiny_skia::PixmapRef::from_bytes(&sprite, gw, gh).unwrap();
+
+            // On the canvas: for sprites hanging off its top/left edge
+            // tiny-skia also paints one padded row/column past the sprite,
+            // which the direct blend does not reproduce.
+            let x = (rng.next() * 34.0) as i32;
+            let y = (rng.next() * 26.0) as i32;
+            let opacity = [1.0, 0.6, 0.2, 0.0][case % 4];
+            let clip = Rectangle {
+                x: rng.next() * 30.0,
+                y: rng.next() * 20.0,
+                width: rng.next() * 30.0 + 0.5,
+                height: rng.next() * 25.0 + 0.5,
+            };
+
+            let mut expected = crate::engine::tests::noise(32, 24, case as u64);
+            let mut actual = expected.clone();
+
+            let mask = reference_mask(32, 24, clip);
+            expected.draw_pixmap(
+                x,
+                y,
+                glyph,
+                &tiny_skia::PixmapPaint {
+                    opacity,
+                    ..tiny_skia::PixmapPaint::default()
+                },
+                tiny_skia::Transform::identity(),
+                Some(&mask),
+            );
+
+            blend_glyph(
+                &mut actual.as_mut(),
+                &sprite,
+                gw as i32,
+                gh as i32,
+                x,
+                y,
+                opacity,
+                crate::engine::pixel_rect(clip, 32, 24),
+            );
+
+            crate::engine::tests::assert_same_pixels(
+                &expected,
+                &actual,
+                &format!(
+                    "case {case}: {gw}x{gh} at ({x}, {y}) opacity {opacity} clip {clip:?}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn empty_glyphs_are_cached() {
+        let mut font_system = font_system().write().expect("Write font system");
+        let font_system = font_system.raw();
+        let mut buffer = cosmic_text::Buffer::new(
+            font_system,
+            cosmic_text::Metrics::new(16.0, 20.0),
+        );
+        buffer.set_text(
+            font_system,
+            "a b  c",
+            &cosmic_text::Attrs::new(),
+            cosmic_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(font_system, false);
+
+        let mut cache = GlyphCache::new();
+        let mut swash = cosmic_text::SwashCache::new();
+        let mut keys = FxHashSet::default();
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
+                let _ = keys.insert(key);
+                let _ =
+                    cache.allocate(key, Color::WHITE, font_system, &mut swash);
+            }
+        }
+
+        // Every distinct glyph, spaces included, now has an entry.
+        assert_eq!(cache.entries.len(), keys.len());
+        assert!(cache.entries.values().any(|(buffer, _)| buffer.is_empty()));
     }
 }

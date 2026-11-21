@@ -49,6 +49,7 @@ impl Pipeline {
         pixels: &mut tiny_skia::PixmapMut<'_>,
         transform: tiny_skia::Transform,
         clip_mask: Option<&tiny_skia::Mask>,
+        clip_rect: Option<[i32; 4]>,
     ) {
         let mut cache = self.cache.borrow_mut();
 
@@ -113,10 +114,11 @@ impl Pipeline {
         let x = (bounds.x / width_scale) as i32;
         let y = (bounds.y / height_scale) as i32;
 
-        // Fast path (Ferrocord video): an opaque image drawn 1:1, unrotated,
-        // fully opaque and unmasked is a plain row copy.
+        // Fast path (Ferrocord video): an opaque image drawn 1:1, unrotated
+        // and fully opaque is a plain row copy, clipped to the same pixel
+        // rectangle as the clip mask.
         if opacity >= 1.0
-            && clip_mask.is_none()
+            && clip_mask.is_none() == clip_rect.is_none()
             && transform.kx == 0.0
             && transform.ky == 0.0
             && (transform.sx - 1.0).abs() < 1e-3
@@ -133,6 +135,7 @@ impl Pipeline {
                             dx.round() as i64,
                             dy.round() as i64,
                             pixels,
+                            clip_rect,
                         )
                     {
                         return;
@@ -168,7 +171,16 @@ impl Pipeline {
 struct Cache {
     entries: FxHashMap<raster::Id, Option<Entry>>,
     hits: FxHashSet<raster::Id>,
+    frame: u64,
 }
+
+/// Small images not drawn in the last frame are kept (most recent first)
+/// up to this many bytes, so animation frames are not converted again on
+/// every loop. Larger images, like video frames, are dropped right away.
+const IDLE_BUDGET: usize = 32 * 1024 * 1024;
+const MAX_IDLE_ENTRY: usize = 1024 * 1024;
+/// Idle images are dropped after this many frames regardless.
+const MAX_IDLE_FRAMES: u64 = 600;
 
 impl Cache {
     pub fn allocate(
@@ -194,6 +206,7 @@ impl Cache {
                     height: *height,
                     pixels: buffer,
                     opaque,
+                    last_used: self.frame,
                 }));
             } else {
                 let image = match graphics::image::load(handle) {
@@ -216,6 +229,7 @@ impl Cache {
                     height: image.height(),
                     pixels: buffer,
                     opaque,
+                    last_used: self.frame,
                 }));
             }
         }
@@ -239,7 +253,48 @@ impl Cache {
     }
 
     fn trim(&mut self) {
-        self.entries.retain(|key, _| self.hits.contains(key));
+        self.frame += 1;
+        let frame = self.frame;
+
+        for id in &self.hits {
+            if let Some(Some(entry)) = self.entries.get_mut(id) {
+                entry.last_used = frame;
+            }
+        }
+
+        let mut idle: Vec<(u64, raster::Id, usize)> = self
+            .entries
+            .iter()
+            .filter(|(id, _)| !self.hits.contains(*id))
+            .filter_map(|(id, entry)| {
+                let entry = entry.as_ref()?;
+                let bytes = entry.pixels.len() * 4;
+
+                (bytes <= MAX_IDLE_ENTRY
+                    && frame - entry.last_used <= MAX_IDLE_FRAMES)
+                    .then_some((entry.last_used, *id, bytes))
+            })
+            .collect();
+
+        idle.sort_unstable_by_key(|(last_used, _, _)| {
+            std::cmp::Reverse(*last_used)
+        });
+
+        let mut budget = IDLE_BUDGET;
+        let keep: FxHashSet<raster::Id> = idle
+            .into_iter()
+            .filter(|(_, _, bytes)| {
+                let fits = *bytes <= budget;
+                if fits {
+                    budget -= bytes;
+                }
+                fits
+            })
+            .map(|(_, id, _)| id)
+            .collect();
+
+        self.entries
+            .retain(|id, _| self.hits.contains(id) || keep.contains(id));
         self.hits.clear();
     }
 }
@@ -250,6 +305,7 @@ struct Entry {
     height: u32,
     pixels: Vec<u32>,
     opaque: bool,
+    last_used: u64,
 }
 
 /// RGBA bytes to tiny-skia's premultiplied BGRA words. Opaque images (video
@@ -281,15 +337,18 @@ fn blit(
     x: i64,
     y: i64,
     pixels: &mut tiny_skia::PixmapMut<'_>,
+    clip: Option<[i32; 4]>,
 ) -> bool {
     let (tw, th) = (i64::from(pixels.width()), i64::from(pixels.height()));
+    let [cx0, cy0, cx1, cy1] =
+        clip.map_or([0, 0, tw, th], |rect| rect.map(i64::from));
     let Ok(dst) = bytemuck::try_cast_slice_mut::<u8, u32>(pixels.data_mut())
     else {
         return false;
     };
     let (w, h) = (i64::from(entry.width), i64::from(entry.height));
-    let (x0, x1) = (x.max(0), (x + w).min(tw));
-    let (y0, y1) = (y.max(0), (y + h).min(th));
+    let (x0, x1) = (x.max(cx0).max(0), (x + w).min(cx1).min(tw));
+    let (y0, y1) = (y.max(cy0).max(0), (y + h).min(cy1).min(th));
     if x0 >= x1 || y0 >= y1 {
         return true;
     }
@@ -300,4 +359,102 @@ fn blit(
         dst[d..d + len].copy_from_slice(&entry.pixels[src..src + len]);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Point, border};
+    use crate::engine::tests::reference_mask;
+
+    fn opaque(width: u32, height: u32, seed: u8) -> raster::Handle {
+        let pixels = (0..width * height)
+            .flat_map(|i| [seed, (i % 251) as u8, (i / width % 253) as u8, 255])
+            .collect::<Vec<u8>>();
+        raster::Handle::from_rgba(width, height, pixels)
+    }
+
+    #[test]
+    fn clipped_blit_matches_draw_pixmap() {
+        let handle = opaque(40, 30, 9);
+        // On the canvas (see the note in `text::tests`).
+        let bounds =
+            Rectangle::new(Point::new(5.0, 4.0), Size::new(40.0, 30.0));
+        for clip in [
+            Rectangle::new(Point::new(10.3, 2.6), Size::new(20.2, 13.7)),
+            Rectangle::new(Point::new(0.0, 0.0), Size::new(64.0, 48.0)),
+            Rectangle::new(Point::new(30.5, 20.5), Size::new(100.0, 100.0)),
+        ] {
+            let mask = reference_mask(64, 48, clip);
+
+            let mut expected = crate::engine::tests::noise(64, 48, 5);
+            let mut actual = expected.clone();
+
+            let mut pipeline = Pipeline::new();
+            {
+                let mut cache = pipeline.cache.borrow_mut();
+                let image = cache.allocate(&handle).unwrap();
+                expected.draw_pixmap(
+                    5,
+                    4,
+                    image,
+                    &tiny_skia::PixmapPaint::default(),
+                    tiny_skia::Transform::identity(),
+                    Some(&mask),
+                );
+            }
+
+            pipeline.draw(
+                &handle,
+                raster::FilterMethod::Nearest,
+                bounds,
+                bounds,
+                border::Radius::default(),
+                1.0,
+                &mut actual.as_mut(),
+                tiny_skia::Transform::identity(),
+                Some(&mask),
+                Some(crate::engine::pixel_rect(clip, 64, 48)),
+            );
+
+            crate::engine::tests::assert_same_pixels(
+                &expected,
+                &actual,
+                &format!("clip {clip:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn small_idle_images_survive_a_trim() {
+        let mut cache = Cache::default();
+        let small = opaque(32, 32, 1);
+        let other = opaque(32, 32, 2);
+        let large = opaque(1024, 512, 3);
+
+        for handle in [&small, &other, &large] {
+            let _ = cache.allocate(handle);
+        }
+        cache.trim();
+
+        // Only `small` is drawn in the next frame.
+        let _ = cache.allocate(&small);
+        cache.trim();
+
+        assert!(cache.entries.contains_key(&small.id()));
+        assert!(cache.entries.contains_key(&other.id()), "small idle kept");
+        assert!(
+            !cache.entries.contains_key(&large.id()),
+            "large idle dropped"
+        );
+
+        for _ in 0..=MAX_IDLE_FRAMES {
+            let _ = cache.allocate(&small);
+            cache.trim();
+        }
+        assert!(
+            !cache.entries.contains_key(&other.id()),
+            "dropped after the idle limit"
+        );
+    }
 }
