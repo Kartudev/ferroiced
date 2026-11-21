@@ -1,9 +1,9 @@
 > **ferroiced** — fork of [iced](https://github.com/iced-rs/iced) maintained for
 > [Ferrocord](https://github.com/Dasemu/Ferrocord). It is iced **0.14.1**
 > (release commit `df71aa93b`) plus changes to `iced_tiny_skia` only: a fast
-> path for opaque raster images (no premultiply for opaque pixels, row-copy
-> blit for 1:1 draws), used for in-app video, and two rendering fixes
-> (clipped shadows, rounded raster images). Crate names are unchanged so it can be
+> path for opaque raster images (used for in-app video), redraws that only
+> touch what can be seen (6-180x less CPU per frame in a chat-like UI, same
+> pixels), and two rendering fixes (clipped shadows, rounded raster images). Crate names are unchanged so it can be
 > used via `[patch.crates-io]`. Not affiliated with or endorsed by the iced
 > project; all credit for iced goes to its authors (MIT, see `LICENSE`).
 >
@@ -34,6 +34,55 @@
 > 1080p60 scaled to 400×225 ~30% either way, since the 1:1 row-copy path only
 > applies to unscaled draws. To hit it, scale frames to physical pixels
 > (logical bounds × scale factor) and draw with `FilterMethod::Nearest`.
+>
+> **Redraw only what can be seen.** Measured on a Ferrocord-like scene
+> (server rail, channel list, 30-message chat, member list, composer;
+> 1920×1080 at 125%, Ryzen 9 7940HS, release, CPU time of one
+> `Renderer::draw`, mean of 300 frames):
+>
+> | Frame | before | ferroiced |
+> |---|---|---|
+> | Cursor blink (3×22 damage) | 1.46 ms | **0.008 ms** |
+> | Hover one message | 2.17 ms | **0.08 ms** |
+> | GIF frame 300×200 | 3.25 ms | **0.17 ms** |
+> | Scrolling the chat | 11.3 ms | **1.13 ms** |
+> | Full redraw | 15.6 ms | **2.5 ms** |
+> | 540p video in the chat | 7.0 ms | **0.55 ms** |
+> | 540p video cut by the chat edge | 10.5 ms | **0.49 ms** |
+>
+> Every frame of that scene is pixel-identical before and after, and pixel
+> tests compare each new path with what tiny-skia draws.
+>
+> - **Empty glyphs are cached.** The glyph cache never stored glyphs
+>   without pixels (spaces), so every space went through swash again on
+>   every frame: about 15% of the glyphs and most of the text time.
+> - **Quads are only rasterized where they can be seen.** A quad was filled
+>   over its whole area and only then cut by the clip mask, so a blinking
+>   cursor repainted the full-window backgrounds. Square quads (and rounded
+>   ones whose corners lie outside the clip) are cut to the clip, and opaque
+>   solid ones are written directly, with only their anti-aliased edges
+>   going through tiny-skia.
+> - **Glyphs are blended directly**, with the same f32 arithmetic and
+>   rounding as `draw_pixmap`, clipped and culled against the clip rectangle
+>   instead of the mask (the mask is no longer rebuilt per text).
+> - **The clip mask is updated incrementally**: only the previous and the new
+>   rectangle are written, instead of clearing the whole window-sized mask
+>   several times per frame.
+> - **Opaque 1:1 images use the row-copy path when clipped too** (a video cut
+>   by a scrollable's edge), since the clip is always a rectangle.
+> - **Small images stay cached while idle** (up to 32 MiB, 1 MiB each, 600
+>   frames), so animation frames are not converted again on every loop.
+>   Large images, like video frames, are still dropped after one idle frame.
+> - **Only damaged regions are sent to the window** (`present_with_damage`,
+>   honoured by softbuffer on Win32, X11 SHM and Wayland). On Win32 a full
+>   1080p present costs 0.86 ms, a cursor-sized one 0.01 ms. A redraw with
+>   no damage (an expose) still presents everything; set
+>   `FERROICED_FULL_PRESENT=1` to always present the whole window (X11 without
+>   a compositor, if exposed areas are not repainted).
+>
+> One stock tiny-skia quirk is not reproduced: for an image or glyph hanging
+> off the top/left edge of the window, tiny-skia also paints one padded
+> row/column past its bottom/right edge.
 >
 > **Bug fixes over stock `iced_tiny_skia` 0.14.1** (both covered by pixel
 > tests in `tiny_skia/src/engine.rs`):
