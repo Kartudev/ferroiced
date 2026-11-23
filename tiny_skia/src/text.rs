@@ -244,6 +244,28 @@ fn draw(
     }
 }
 
+/// `byte * (1 / 255)` as tiny-skia loads a channel into its f32 pipeline.
+const UNIT: [f32; 256] = {
+    const FACTOR: f32 = 1.0 / 255.0;
+    let mut table = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f32 * FACTOR;
+        i += 1;
+    }
+    table
+};
+
+/// Rounds `value` (in `0.0..=255.0`) to the nearest integer, ties to even,
+/// like tiny-skia's `round_int`. Adding 2^23 leaves no fraction bits, so the
+/// FPU rounds (to nearest even); subtracting it again is exact. Unlike
+/// `f32::round_ties_even`, this needs no SSE4.1 instruction or libm call.
+#[inline(always)]
+fn round_to_u8(value: f32) -> u8 {
+    const MAGIC: f32 = 8_388_608.0;
+    ((value + MAGIC) - MAGIC) as u8
+}
+
 /// Draws a premultiplied glyph sprite at (`x`, `y`) with source-over,
 /// clipped to `clip` (`[x0, y0, x1, y1]`). This is the arithmetic of
 /// tiny-skia's `draw_pixmap` with an identity transform (its f32 pipeline:
@@ -274,8 +296,8 @@ fn blend_glyph(
         return;
     }
 
-    const FACTOR: f32 = 1.0 / 255.0;
     let opacity = opacity.min(1.0);
+    let scaled = opacity < 1.0;
     let stride = pixels.width() as usize;
     let data = pixels.data_mut();
 
@@ -293,18 +315,20 @@ fn blend_glyph(
             .iter()
             .zip(target.as_chunks_mut::<4>().0)
         {
-            if src[3] == 0 {
-                continue;
+            match src[3] {
+                0 => continue,
+                // Fully covered: the result is the source pixel itself
+                // (checked for every value in `opaque_glyph_pixels_are_copied`).
+                255 if !scaled => {
+                    *dst = *src;
+                    continue;
+                }
+                _ => {}
             }
 
-            let mut s = [
-                f32::from(src[0]) * FACTOR,
-                f32::from(src[1]) * FACTOR,
-                f32::from(src[2]) * FACTOR,
-                f32::from(src[3]) * FACTOR,
-            ];
+            let mut s = src.map(|channel| UNIT[usize::from(channel)]);
 
-            if opacity < 1.0 {
+            if scaled {
                 for channel in &mut s {
                     *channel *= opacity;
                 }
@@ -313,8 +337,8 @@ fn blend_glyph(
             let inverse = 1.0 - s[3];
 
             for (&s, d) in s.iter().zip(dst.iter_mut()) {
-                let value = (f32::from(*d) * FACTOR) * inverse + s;
-                *d = (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
+                let value = UNIT[usize::from(*d)] * inverse + s;
+                *d = round_to_u8(value.clamp(0.0, 1.0) * 255.0);
             }
         }
     }
@@ -534,6 +558,89 @@ mod tests {
                     "case {case}: {gw}x{gh} at ({x}, {y}) opacity {opacity} clip {clip:?}"
                 ),
             );
+        }
+    }
+
+    /// tiny-skia's source-over for one channel, written plainly.
+    fn reference_channel(s: u8, sa: u8, d: u8, opacity: f32) -> u8 {
+        const FACTOR: f32 = 1.0 / 255.0;
+        let mut s = f32::from(s) * FACTOR;
+        let mut sa = f32::from(sa) * FACTOR;
+        if opacity < 1.0 {
+            s *= opacity;
+            sa *= opacity;
+        }
+        let value = (f32::from(d) * FACTOR) * (1.0 - sa) + s;
+        (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8
+    }
+
+    #[test]
+    fn rounding_matches_round_ties_even() {
+        let mut value = 0.0f32;
+        while value <= 255.0 {
+            assert_eq!(
+                round_to_u8(value),
+                value.round_ties_even() as u8,
+                "{value}"
+            );
+            value = f32::from_bits(value.to_bits() + 97);
+        }
+        for half in 0..255 {
+            let value = half as f32 + 0.5;
+            assert_eq!(round_to_u8(value), value.round_ties_even() as u8);
+        }
+    }
+
+    #[test]
+    fn blending_matches_the_formula_for_every_value() {
+        for opacity in [1.0, 0.6] {
+            for sa in 0..=255u8 {
+                for s in 0..=sa {
+                    for d in 0..=255u8 {
+                        let sprite = [s, s, s, sa];
+                        let mut pixel = [d, d, d, d];
+                        let mut target =
+                            tiny_skia::PixmapMut::from_bytes(&mut pixel, 1, 1)
+                                .unwrap();
+                        blend_glyph(
+                            &mut target,
+                            &sprite,
+                            1,
+                            1,
+                            0,
+                            0,
+                            opacity,
+                            [0, 0, 1, 1],
+                        );
+                        let expected = if sa == 0 {
+                            d
+                        } else {
+                            reference_channel(s, sa, d, opacity)
+                        };
+                        assert_eq!(
+                            pixel[0], expected,
+                            "s {s} sa {sa} d {d} opacity {opacity}"
+                        );
+                        assert_eq!(
+                            pixel[3],
+                            if sa == 0 {
+                                d
+                            } else {
+                                reference_channel(sa, sa, d, opacity)
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_glyph_pixels_are_copied() {
+        for s in 0..=255u8 {
+            for d in 0..=255u8 {
+                assert_eq!(reference_channel(s, 255, d, 1.0), s, "s {s} d {d}");
+            }
         }
     }
 
