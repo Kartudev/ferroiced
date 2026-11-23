@@ -79,30 +79,13 @@ impl Renderer {
         for &damage_bounds in damage {
             let damage_bounds = damage_bounds * scale_factor;
 
-            let path = tiny_skia::PathBuilder::from_rect(
-                tiny_skia::Rect::from_xywh(
-                    damage_bounds.x,
-                    damage_bounds.y,
-                    damage_bounds.width,
-                    damage_bounds.height,
-                )
-                .expect("Create damage rectangle"),
-            );
-
-            pixels.fill_path(
-                &path,
-                &tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(engine::into_color(
-                        background_color,
-                    )),
-                    anti_alias: false,
-                    blend_mode: tiny_skia::BlendMode::Source,
-                    ..Default::default()
-                },
-                tiny_skia::FillRule::default(),
-                tiny_skia::Transform::identity(),
-                None,
-            );
+            // Skip clearing what an opaque quad of the bottom layer will
+            // cover anyway (a panel background under a scrolled chat, say):
+            // those pixels end up the quad's colour whatever was there.
+            if !self.covered_by_opaque_quad(damage_bounds, scale_factor, pixels)
+            {
+                clear(pixels, damage_bounds, background_color);
+            }
 
             for layer in self.layers.iter() {
                 let Some(layer_bounds) =
@@ -196,6 +179,47 @@ impl Renderer {
         }
 
         self.engine.trim();
+    }
+
+    /// Whether an opaque, square quad of the bottom layer paints every pixel
+    /// of `damage` (physical) itself, so clearing it first is wasted work.
+    fn covered_by_opaque_quad(
+        &self,
+        damage: Rectangle,
+        scale_factor: f32,
+        pixels: &tiny_skia::PixmapMut<'_>,
+    ) -> bool {
+        #[cfg(test)]
+        if tests::NO_SKIP.get() {
+            return false;
+        }
+
+        let Some(layer) = self.layers.iter().next() else {
+            return false;
+        };
+
+        // The layer clips its quads: it must not cut into the damage.
+        if !damage.is_within(&(layer.bounds * scale_factor)) {
+            return false;
+        }
+
+        // The clear never paints outside these pixels (checked in
+        // `the_clear_stays_inside_its_pixel_rect`).
+        let [x0, y0, x1, y1] =
+            engine::pixel_rect(damage, pixels.width(), pixels.height());
+
+        if x0 >= x1 || y0 >= y1 {
+            return true;
+        }
+
+        let transformation = Transformation::scale(scale_factor);
+
+        layer.quads.iter().any(|(quad, background)| {
+            engine::opaque_interior(quad, background, transformation)
+                .is_some_and(|[ix0, iy0, ix1, iy1]| {
+                    ix0 <= x0 && iy0 <= y0 && ix1 >= x1 && iy1 >= y1
+                })
+        })
     }
 }
 
@@ -459,5 +483,176 @@ impl renderer::Headless for Renderer {
         let viewport = Viewport::with_physical_size(size, scale_factor);
 
         window::compositor::screenshot(self, &viewport, background_color)
+    }
+}
+
+/// Fills `bounds` (physical) with the background colour.
+fn clear(
+    pixels: &mut tiny_skia::PixmapMut<'_>,
+    bounds: Rectangle,
+    background_color: Color,
+) {
+    let path = tiny_skia::PathBuilder::from_rect(
+        tiny_skia::Rect::from_xywh(
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+        )
+        .expect("Create damage rectangle"),
+    );
+
+    pixels.fill_path(
+        &path,
+        &tiny_skia::Paint {
+            shader: tiny_skia::Shader::SolidColor(engine::into_color(
+                background_color,
+            )),
+            anti_alias: false,
+            blend_mode: tiny_skia::BlendMode::Source,
+            ..Default::default()
+        },
+        tiny_skia::FillRule::default(),
+        tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::renderer::{Quad, Renderer as _};
+    use crate::core::{Border, Point};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Disables the skipped clear, to compare with stock behaviour.
+        pub(super) static NO_SKIP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    const BACKGROUND: Color = Color::from_rgb(0.1, 0.2, 0.3);
+
+    /// Draws `quads` (bottom layer) over `canvas`, redrawing only `damage`
+    /// (logical) at a 1.25 scale factor.
+    fn draw(
+        quads: &[(Rectangle, Color, f32)],
+        damage: Rectangle,
+        mut canvas: tiny_skia::Pixmap,
+    ) -> tiny_skia::Pixmap {
+        let mut renderer = Renderer::new(Font::DEFAULT, Pixels(16.0));
+        let viewport = Viewport::with_physical_size(
+            Size::new(canvas.width(), canvas.height()),
+            1.25,
+        );
+        renderer.reset(Rectangle::with_size(viewport.logical_size()));
+
+        for &(bounds, color, radius) in quads {
+            renderer.fill_quad(
+                Quad {
+                    bounds,
+                    border: Border {
+                        radius: radius.into(),
+                        ..Border::default()
+                    },
+                    ..Quad::default()
+                },
+                color,
+            );
+        }
+
+        let mut mask =
+            tiny_skia::Mask::new(canvas.width(), canvas.height()).unwrap();
+        renderer.draw(
+            &mut canvas.as_mut(),
+            &mut mask,
+            &viewport,
+            &[damage],
+            BACKGROUND,
+        );
+        canvas
+    }
+
+    #[test]
+    fn the_clear_stays_inside_its_pixel_rect() {
+        let mut rng = engine::tests::Lcg(5);
+        for _ in 0..2000 {
+            let bounds = Rectangle {
+                x: rng.next() * 60.0 - 5.0,
+                y: rng.next() * 50.0 - 5.0,
+                width: rng.next() * 30.0 + 0.01,
+                height: rng.next() * 25.0 + 0.01,
+            };
+            let mut pixmap = tiny_skia::Pixmap::new(64, 48).unwrap();
+            clear(&mut pixmap.as_mut(), bounds, Color::WHITE);
+
+            let [x0, y0, x1, y1] = engine::pixel_rect(bounds, 64, 48);
+            for (i, pixel) in pixmap.pixels().iter().enumerate() {
+                let (x, y) = ((i % 64) as i32, (i / 64) as i32);
+                if pixel.alpha() != 0 {
+                    assert!(
+                        x >= x0 && x < x1 && y >= y0 && y < y1,
+                        "{bounds:?} paints ({x}, {y}) outside {:?}",
+                        [x0, y0, x1, y1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skipping_the_clear_changes_no_pixel() {
+        let mut rng = engine::tests::Lcg(11);
+        let mut skipped = 0;
+        for case in 0..400 {
+            // Mostly damage inside the opaque quad (the case that skips),
+            // sometimes crossing its edges.
+            let quad = Rectangle::new(
+                Point::new(rng.next() * 10.0, rng.next() * 8.0),
+                Size::new(rng.next() * 50.0 + 5.0, rng.next() * 38.0 + 5.0),
+            );
+            let damage = if case % 3 == 0 {
+                // Damage exactly on the quad, like a scrolled panel.
+                quad
+            } else {
+                Rectangle::new(
+                    Point::new(
+                        quad.x + rng.next() * quad.width * 0.6 - 2.0,
+                        quad.y + rng.next() * quad.height * 0.6 - 2.0,
+                    ),
+                    Size::new(rng.next() * 20.0 + 0.3, rng.next() * 15.0 + 0.3),
+                )
+            };
+            let quads = [
+                (
+                    quad,
+                    Color::from_rgb(rng.next(), rng.next(), rng.next()),
+                    if case % 7 == 0 { 4.0 } else { 0.0 },
+                ),
+                (
+                    Rectangle::new(
+                        Point::new(10.0, 10.0),
+                        Size::new(9.5, 7.25),
+                    ),
+                    Color::from_rgba(0.9, 0.5, 0.1, 0.5),
+                    3.0,
+                ),
+            ];
+            let canvas = engine::tests::noise(80, 60, case);
+
+            NO_SKIP.set(true);
+            let stock = draw(&quads, damage, canvas.clone());
+            NO_SKIP.set(false);
+            let actual = draw(&quads, damage, canvas.clone());
+
+            if stock.data() != canvas.data() && actual.data() == stock.data() {
+                skipped += 1;
+            }
+            engine::tests::assert_same_pixels(
+                &stock,
+                &actual,
+                &format!("quad {quad:?} damage {damage:?}"),
+            );
+        }
+        assert!(skipped > 100, "the skip path ran in only {skipped} cases");
     }
 }

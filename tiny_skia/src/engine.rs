@@ -958,8 +958,20 @@ pub fn adjust_clip_mask(clip_mask: &mut tiny_skia::Mask, bounds: Rectangle) {
         }
     };
 
+    // The remembered rectangle only describes this mask if the mask still
+    // holds it: a new mask can be allocated at the address of a dropped one
+    // (same key) and is all zeros.
+    let holds = |data: &[u8], [x0, y0, x1, y1]: [i32; 4]| {
+        x0 >= x1
+            || y0 >= y1
+            || (data[y0 as usize * stride + x0 as usize] == 255
+                && data[(y1 - 1) as usize * stride + (x1 - 1) as usize] == 255)
+    };
+
     match CLIP_MASK_RECT.get() {
-        Some((ptr, w, h, previous)) if (ptr, w, h) == key => {
+        Some((ptr, w, h, previous))
+            if (ptr, w, h) == key && holds(clip_mask.data(), previous) =>
+        {
             if previous == rect {
                 return;
             }
@@ -1004,6 +1016,53 @@ fn corners_outside(
     })
 }
 
+/// The edges of `bounds` in physical pixels, transformed the way tiny-skia
+/// transforms path points.
+fn physical_edges(
+    bounds: Rectangle,
+    transformation: Transformation,
+) -> [f32; 4] {
+    let transform = into_transform(transformation);
+
+    [
+        bounds.x * transform.sx + transform.tx,
+        bounds.y * transform.sy + transform.ty,
+        (bounds.x + bounds.width) * transform.sx + transform.tx,
+        (bounds.y + bounds.height) * transform.sy + transform.ty,
+    ]
+}
+
+/// The pixels an opaque, solid, square quad paints with its own colour
+/// regardless of what is under it (see [`fill_opaque_rect`]), as
+/// `[x0, y0, x1, y1]`; `None` for any other quad.
+pub(crate) fn opaque_interior(
+    quad: &Quad,
+    background: &Background,
+    transformation: Transformation,
+) -> Option<[i32; 4]> {
+    let Background::Color(color) = background else {
+        return None;
+    };
+
+    if color.a < 1.0
+        || <[f32; 4]>::from(quad.border.radius)
+            .iter()
+            .any(|radius| *radius != 0.0)
+    {
+        return None;
+    }
+
+    let [left, top, right, bottom] =
+        physical_edges(quad.bounds, transformation);
+
+    Some([
+        left.ceil() as i32,
+        top.ceil() as i32,
+        right.floor() as i32,
+        bottom.floor() as i32,
+    ])
+}
+
 /// Fills an opaque, square quad inside `region` (a pixel rectangle): fully
 /// covered pixels are written directly and only the anti-aliased edge
 /// strips go through tiny-skia, giving the same pixels as filling the
@@ -1016,12 +1075,7 @@ fn fill_opaque_rect(
     region: [i32; 4],
     clip_mask: Option<&tiny_skia::Mask>,
 ) {
-    // Transform the corners the way tiny-skia transforms path points.
-    let transform = into_transform(transformation);
-    let left = bounds.x * transform.sx + transform.tx;
-    let top = bounds.y * transform.sy + transform.ty;
-    let right = (bounds.x + bounds.width) * transform.sx + transform.tx;
-    let bottom = (bounds.y + bounds.height) * transform.sy + transform.ty;
+    let [left, top, right, bottom] = physical_edges(bounds, transformation);
 
     let [rx0, ry0, rx1, ry1] = region;
     let outer = [
@@ -1224,6 +1278,25 @@ pub(crate) mod tests {
                     assert!(value == 0 || value == 255);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_new_mask_at_a_reused_address_is_filled() {
+        let bounds = Rectangle {
+            x: 3.0,
+            y: 2.0,
+            width: 20.0,
+            height: 10.0,
+        };
+        let expected = reference_mask(32, 24, bounds);
+
+        // Dropping a mask and allocating one of the same size often reuses
+        // its address; either way, the new mask must get the rectangle.
+        for _ in 0..20 {
+            let mut mask = tiny_skia::Mask::new(32, 24).unwrap();
+            adjust_clip_mask(&mut mask, bounds);
+            assert_eq!(mask.data(), expected.data());
         }
     }
 
