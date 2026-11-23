@@ -65,6 +65,13 @@
 > - **Glyphs are blended directly**, with the same f32 arithmetic and
 >   rounding as `draw_pixmap`, clipped and culled against the clip rectangle
 >   instead of the mask (the mask is no longer rebuilt per text).
+> - **No clear under opaque panels.** Damage covered by an opaque square
+>   quad of the bottom layer (a panel background under a scrolled chat) is no
+>   longer filled with the background colour first: scrolling ~20-30%
+>   cheaper.
+> - **Faster glyph blending**: rounding without a libm call per channel,
+>   table loads and a direct copy for fully covered pixels (10-30% less
+>   text time), checked exhaustively against tiny-skia's formula.
 > - **The clip mask is updated incrementally**: only the previous and the new
 >   rectangle are written, instead of clearing the whole window-sized mask
 >   several times per frame.
