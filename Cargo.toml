@@ -22,7 +22,10 @@ all-features = true
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland"]
+# ferroiced (Ferrocord): `wgpu` and `linux-theme-detection` are off by default.
+# Ferrocord renders with tiny-skia only and has its own Dark/Light theme; both
+# features still work when enabled explicitly.
+default = ["tiny-skia", "crisp", "web-colors", "thread-pool", "x11", "wayland"]
 # Enables the `wgpu` GPU-accelerated renderer with all its default features (Vulkan, Metal, DX12, OpenGL, and WebGPU)
 wgpu = ["wgpu-bare", "iced_renderer/wgpu"]
 # Enables the `wgpu` GPU-accelerated renderer with the minimum required features (no backends!)

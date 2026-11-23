@@ -84,6 +84,14 @@
 > off the top/left edge of the window, tiny-skia also paints one padded
 > row/column past its bottom/right edge.
 >
+> **Leaner defaults.** `wgpu` and `linux-theme-detection` are no longer default
+> features (both still work if enabled explicitly). Ferrocord renders with
+> tiny-skia only and has its own Dark/Light theme. Measured in Ferrocord on
+> Windows: the release binary goes from 48.2 to 41.5 MB, 42 fewer crates are
+> built, and `opengl32.dll` is no longer loaded at runtime; on Linux it also
+> skips the D-Bus color-scheme subscription and its startup wait (up to
+> 200 ms).
+>
 > **Bug fixes over stock `iced_tiny_skia` 0.14.1** (both covered by pixel
 > tests in `tiny_skia/src/engine.rs`):
 >
